@@ -32,27 +32,37 @@ Target Startup Sectors & Roles:
 - Target Roles: Software Engineering Intern / Early-Stage Founding Engineer / Full-Stack & Backend Systems Engineer.
 """
 
-def fetch_recent_launches(days_back=7):
-    """Fetches Launch HN posts from the last N days."""
-    cutoff_time = int((datetime.datetime.now() - datetime.timedelta(days=days_back)).timestamp())
-    story_ids = requests.get(f"{HN_API}/newstories.json").json()[:250]
-    launches = []
+def fetch_recent_launches(days_back=14):
+    """Fetches recent 'Launch HN:' posts via the Algolia HN Search API."""
+    cutoff_timestamp = int((datetime.datetime.now() - datetime.timedelta(days=days_back)).timestamp())
     
-    for sid in story_ids:
-        item = requests.get(f"{HN_API}/item/{sid}.json").json()
-        if not item or "title" not in item:
-            continue
+    url = "https://hn.algolia.com/api/v1/search"
+    params = {
+        "query": "Launch HN:",
+        "tags": "story",
+        "numericFilters": f"created_at_i>{cutoff_timestamp}",
+        "hitsPerPage": 50
+    }
+    
+    try:
+        response = requests.get(url, params=params).json()
+        hits = response.get("hits", [])
         
-        if item.get("time", 0) >= cutoff_time and "Launch HN:" in item.get("title", ""):
-            launches.append({
-                "id": item.get("id"),
-                "title": item.get("title").replace("Launch HN: ", "").strip(),
-                "author": item.get("by", "Founder"),
-                "url": f"https://news.ycombinator.com/item?id={sid}",
-                "text": item.get("text", "")[:1500]
-            })
-            
-    return launches
+        launches = []
+        for hit in hits:
+            title = hit.get("title", "")
+            if "Launch HN:" in title:
+                launches.append({
+                    "id": hit.get("objectID"),
+                    "title": title.replace("Launch HN: ", "").strip(),
+                    "author": hit.get("author", "Founder"),
+                    "url": f"https://news.ycombinator.com/item?id={hit.get('objectID')}",
+                    "text": hit.get("story_text") or hit.get("comment_text") or title
+                })
+        return launches
+    except Exception as e:
+        print(f"Error fetching from HN Algolia API: {e}")
+        return []
 
 def evaluate_startup(client, launch):
     """Evaluates launch alignment and structures output into JSON."""
