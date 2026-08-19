@@ -96,6 +96,13 @@ Analyze this startup for candidate fit. Respond strictly in valid JSON format:
 
 def create_notion_page(launch, analysis):
     """Adds a structured page and CRM card into Notion."""
+    if not NOTION_API_KEY:
+        print("ERROR: NOTION_API_KEY is empty or None!")
+        return
+    else:
+        # Prints something like: Key loaded: ntn_5948... (len: 50)
+        print(f"Key loaded: {NOTION_API_KEY[:8]}... (len: {len(NOTION_API_KEY)})")
+        
     headers = {
         "Authorization": f"Bearer {NOTION_API_KEY}",
         "Content-Type": "application/json",
@@ -169,6 +176,12 @@ def create_notion_page(launch, analysis):
         print(f"Successfully added {launch['title']} to Notion.")
     else:
         print(f"Failed to add {launch['title']}: {res.text}")
+
+
+
+
+
+
 
 def main():
     print("Checking Hacker News for recent YC launches...")
