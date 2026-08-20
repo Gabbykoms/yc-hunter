@@ -133,17 +133,17 @@ def fetch_who_is_hiring():
         hits = res.get("hits", [])
         if not hits:
             return []
-        
+
         latest_thread = hits[0]
         thread_id = latest_thread.get("objectID")
         thread_title = latest_thread.get("title", "")
         print(f"Scanning latest thread: '{thread_title}' (ID: {thread_id})...")
-        
+
         # Pull top comments from this thread
         comments_url = "https://hn.algolia.com/api/v1/search"
         comment_params = {
             "tags": f"comment,story_{thread_id}",
-            "hitsPerPage": 25
+            "hitsPerPage": 15
         }
         comment_data = requests.get(comments_url, params=comment_params).json()
         
@@ -185,7 +185,7 @@ def fetch_funding_announcements(days_back=14):
         "query": "seed round OR Series A OR raised OR seed funding",
         "tags": "story",
         "numericFilters": f"created_at_i>{cutoff}",
-        "hitsPerPage": 15
+        "hitsPerPage": 10
     }
     results = []
     try:
@@ -203,6 +203,20 @@ def fetch_funding_announcements(days_back=14):
     except Exception as e:
         print(f"Error in fetch_funding_announcements: {e}")
     return results
+
+def is_candidate_potentially_relevant(item):
+    """Quick heuristic filter to avoid unnecessary API calls on obvious mismatches."""
+    text = (item["title"] + " " + item["text"]).lower()
+
+    # Must have hiring or venture signals
+    has_hiring = any(word in text for word in ["hiring", "engineer", "developer", "founding", "role", "team"])
+    has_venture = any(word in text for word in ["raised", "series", "seed", "funded", "$", "million", "venture"])
+
+    # Avoid clear non-matches
+    bad_keywords = ["freelance", "visa", "non-tech", "sales only", "marketing", "bc2b", "b2b sales"]
+    has_bad_signals = any(word in text for word in bad_keywords)
+
+    return (has_hiring or has_venture) and not has_bad_signals
 
 def evaluate_opportunity(client, item, max_retries=3):
     """Evaluates fit with rate-limit handling and backoff."""
@@ -363,32 +377,36 @@ def main():
         title_clean = lead["title"].strip().lower()
         title_key = title_clean[:40]
         url_key = lead["url"].strip().lower()
-        
+
         # 1. Deduplicate against existing Notion records
         if title_key in existing_titles or url_key in existing_urls:
             continue
-            
+
         # 2. Deduplicate within current run
         if title_key in seen_in_this_batch:
             continue
         seen_in_this_batch.add(title_key)
-        
+
+        # 3. Pre-filter to avoid API calls on obvious mismatches
+        if not is_candidate_potentially_relevant(lead):
+            continue
+
         analysis = evaluate_opportunity(client, lead)
-        
+
         try:
             score = float(analysis.get("score", 0)) if analysis else 0
         except (ValueError, TypeError):
             score = 0
-            
-        if analysis and score >= 8:
+
+        if analysis and score >= 7:
             print(f"High match ({score}/10): {lead['title'][:50]}")
             create_notion_page(lead, analysis)
             existing_titles.add(title_key)
             existing_urls.add(url_key)
             new_leads_processed += 1
-            
+
         # Pacing to stay comfortably within free-tier rate limits
-        time.sleep(3)
+        time.sleep(10)
 
     print(f"Done. Added {new_leads_processed} new opportunities to Notion.")
 
