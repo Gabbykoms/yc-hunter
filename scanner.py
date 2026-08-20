@@ -1,6 +1,6 @@
-
 import os
 import json
+import html
 import datetime
 import requests
 from google import genai
@@ -32,6 +32,63 @@ Target Startup Sectors & Roles:
 - Target Roles: Software Engineering Intern / Early-Stage Founding Engineer / Full-Stack & Backend Systems Engineer.
 """
 
+def fetch_existing_notion_records():
+    """Queries Notion to get all existing company names and HN links to avoid duplicates."""
+    if not NOTION_API_KEY or not NOTION_DATABASE_ID:
+        print("Warning: Notion credentials missing, skipping duplicate check.")
+        return set(), set()
+
+    headers = {
+        "Authorization": f"Bearer {NOTION_API_KEY.strip()}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28"
+    }
+    
+    existing_titles = set()
+    existing_urls = set()
+    has_more = True
+    start_cursor = None
+    
+    while has_more:
+        payload = {}
+        if start_cursor:
+            payload["start_cursor"] = start_cursor
+            
+        try:
+            res = requests.post(
+                f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query",
+                headers=headers,
+                json=payload
+            )
+            
+            if res.status_code != 200:
+                print(f"Warning: Could not fetch existing Notion records: {res.text}")
+                break
+                
+            data = res.json()
+            for page in data.get("results", []):
+                props = page.get("properties", {})
+                
+                # Extract Title
+                title_list = props.get("Company", {}).get("title", [])
+                if title_list:
+                    title_text = title_list[0].get("text", {}).get("content", "").strip().lower()
+                    existing_titles.add(title_text[:40])
+                
+                # Extract URL
+                url = props.get("HN Link", {}).get("url")
+                if url:
+                    existing_urls.add(url.strip().lower())
+                    
+            has_more = data.get("has_more", False)
+            start_cursor = data.get("next_cursor")
+            
+        except Exception as e:
+            print(f"Error querying Notion database for duplicates: {e}")
+            break
+            
+    return existing_titles, existing_urls
+
 def fetch_launch_hn(days_back=14):
     """Fetches recent 'Launch HN:' posts via Algolia."""
     cutoff = int((datetime.datetime.now() - datetime.timedelta(days=days_back)).timestamp())
@@ -50,10 +107,10 @@ def fetch_launch_hn(days_back=14):
             if "Launch HN:" in title:
                 results.append({
                     "source": "Launch HN",
-                    "title": title.replace("Launch HN: ", "").strip(),
+                    "title": html.unescape(title.replace("Launch HN: ", "").strip()),
                     "author": hit.get("author", "Founder"),
                     "url": f"https://news.ycombinator.com/item?id={hit.get('objectID')}",
-                    "text": hit.get("story_text") or hit.get("comment_text") or title
+                    "text": html.unescape(hit.get("story_text") or hit.get("comment_text") or title)
                 })
     except Exception as e:
         print(f"Error in fetch_launch_hn: {e}")
@@ -62,7 +119,6 @@ def fetch_launch_hn(days_back=14):
 def fetch_who_is_hiring():
     """Fetches top-level job postings from the latest monthly 'Ask HN: Who is hiring?' thread."""
     url = "https://hn.algolia.com/api/v1/search"
-    # Find the latest Who is Hiring thread
     params = {
         "query": "Ask HN: Who is hiring?",
         "tags": "story,author_whoishiring",
@@ -78,7 +134,6 @@ def fetch_who_is_hiring():
         thread_id = hits[0].get("objectID")
         print(f"Scanning Who is Hiring thread (ID: {thread_id})...")
         
-        # Pull top comments from this thread
         comments_url = "https://hn.algolia.com/api/v1/search"
         comment_params = {
             "tags": f"comment,story_{thread_id}",
@@ -87,12 +142,12 @@ def fetch_who_is_hiring():
         comment_data = requests.get(comments_url, params=comment_params).json()
         
         for c in comment_data.get("hits", []):
-            text = c.get("comment_text", "")
-            if len(text) < 100:
+            raw_text = c.get("comment_text", "")
+            if len(raw_text) < 100:
                 continue
             
-            # The first line of Who is Hiring comments usually contains: "Company | Role | Location | Stack"
-            first_line = text.split("<p>")[0].replace("&#x2F;", "/").replace("&amp;", "&")
+            clean_text = html.unescape(raw_text)
+            first_line = clean_text.split("<p>")[0].replace("&#x2F;", "/").replace("&amp;", "&").strip()
             company_title = first_line[:80].strip()
             
             results.append({
@@ -100,7 +155,7 @@ def fetch_who_is_hiring():
                 "title": company_title,
                 "author": c.get("author", "Hiring Team"),
                 "url": f"https://news.ycombinator.com/item?id={c.get('objectID')}",
-                "text": text[:1500]
+                "text": clean_text[:1500]
             })
     except Exception as e:
         print(f"Error in fetch_who_is_hiring: {e}")
@@ -121,14 +176,13 @@ def fetch_funding_announcements(days_back=21):
         data = requests.get(url, params=params).json()
         for hit in data.get("hits", []):
             title = hit.get("title", "")
-            # Filter out generic articles / big tech news
             if any(term in title.lower() for term in ["raised", "series a", "seed round", "$"]):
                 results.append({
                     "source": "Funding News",
-                    "title": title,
+                    "title": html.unescape(title),
                     "author": hit.get("author", "Founder"),
                     "url": f"https://news.ycombinator.com/item?id={hit.get('objectID')}",
-                    "text": hit.get("story_text") or title
+                    "text": html.unescape(hit.get("story_text") or title)
                 })
     except Exception as e:
         print(f"Error in fetch_funding_announcements: {e}")
@@ -150,7 +204,7 @@ Task:
 2. Rate Gabriel's match from 1-10 based on his skills in Python, TS/Next.js, C++, Cloud/K8s, Agents, and Real-Time Systems.
 3. If fit >= 7, propose a concrete 2-hour demo project and a 1-sentence cold outreach email hook.
 
-Respond strictly in valid JSON:
+Respond strictly in valid JSON format:
 {{
   "score": <number 1-10>,
   "funding_or_hiring_signal": "<e.g., Active Hiring / Seed Stage / Series A>",
@@ -179,6 +233,12 @@ def create_notion_page(item, analysis):
     }
     
     today = datetime.date.today().isoformat()
+    raw_score = analysis.get("score", 0)
+    
+    try:
+        score_val = float(raw_score)
+    except (ValueError, TypeError):
+        score_val = 0.0
     
     payload = {
         "parent": {"database_id": NOTION_DATABASE_ID},
@@ -187,7 +247,7 @@ def create_notion_page(item, analysis):
                 "title": [{"text": {"content": item["title"][:100]}}]
             },
             "Score": {
-                "number": int(analysis.get("score", 0))
+                "number": score_val
             },
             "Status": {
                 "select": {"name": "New Lead"}
@@ -246,23 +306,23 @@ def create_notion_page(item, analysis):
         print(f"Failed to add {item['title'][:30]}: {res.text}")
 
 def main():
+    print("Checking Notion for existing leads to prevent duplicates...")
+    existing_titles, existing_urls = fetch_existing_notion_records()
+    print(f"Found {len(existing_titles)} existing companies in Notion tracker.")
+
     print("Aggregating opportunities across multiple startup feeds...")
-    
     all_leads = []
     
-    # 1. Recent YC Launches
     print("-> Fetching Launch HN...")
     all_leads.extend(fetch_launch_hn(days_back=14))
     
-    # 2. Direct Hiring Threads
     print("-> Fetching Ask HN: Who is hiring?...")
     all_leads.extend(fetch_who_is_hiring())
     
-    # 3. Funded Startup Announcements
     print("-> Fetching recent funding announcements...")
     all_leads.extend(fetch_funding_announcements(days_back=21))
     
-    print(f"Total opportunities discovered across feeds: {len(all_leads)}")
+    print(f"Total discovered leads: {len(all_leads)}")
     
     if not all_leads:
         print("No leads found across feeds.")
@@ -270,19 +330,38 @@ def main():
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     
-    # Deduplicate by title to prevent duplicates
-    seen_titles = set()
+    seen_in_this_batch = set()
+    new_leads_processed = 0
     
     for lead in all_leads:
-        title_key = lead["title"][:40].lower()
-        if title_key in seen_titles:
+        title_clean = lead["title"].strip().lower()
+        title_key = title_clean[:40]
+        url_key = lead["url"].strip().lower()
+        
+        # 1. Deduplicate against existing Notion records
+        if title_key in existing_titles or url_key in existing_urls:
             continue
-        seen_titles.add(title_key)
+            
+        # 2. Deduplicate within current run
+        if title_key in seen_in_this_batch:
+            continue
+        seen_in_this_batch.add(title_key)
         
         analysis = evaluate_opportunity(client, lead)
-        if analysis and analysis.get("score", 0) >= 8:  # Strict filter for high signal
-            print(f"High match ({analysis.get('score')}/10): {lead['title'][:50]}")
+        
+        try:
+            score = float(analysis.get("score", 0)) if analysis else 0
+        except (ValueError, TypeError):
+            score = 0
+            
+        if analysis and score >= 8:
+            print(f"High match ({score}/10): {lead['title'][:50]}")
             create_notion_page(lead, analysis)
+            existing_titles.add(title_key)
+            existing_urls.add(url_key)
+            new_leads_processed += 1
+
+    print(f"Done. Added {new_leads_processed} new opportunities to Notion.")
 
 if __name__ == "__main__":
     main()
