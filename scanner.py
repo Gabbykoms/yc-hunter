@@ -1,3 +1,4 @@
+
 import os
 import json
 import datetime
@@ -5,7 +6,6 @@ import requests
 from google import genai
 
 # --- CONFIGURATION ---
-HN_API = "https://hacker-news.firebaseio.com/v0"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
@@ -32,55 +32,131 @@ Target Startup Sectors & Roles:
 - Target Roles: Software Engineering Intern / Early-Stage Founding Engineer / Full-Stack & Backend Systems Engineer.
 """
 
-def fetch_recent_launches(days_back=14):
-    """Fetches recent 'Launch HN:' posts via the Algolia HN Search API."""
-    cutoff_timestamp = int((datetime.datetime.now() - datetime.timedelta(days=days_back)).timestamp())
-    
+def fetch_launch_hn(days_back=14):
+    """Fetches recent 'Launch HN:' posts via Algolia."""
+    cutoff = int((datetime.datetime.now() - datetime.timedelta(days=days_back)).timestamp())
     url = "https://hn.algolia.com/api/v1/search"
     params = {
         "query": "Launch HN:",
         "tags": "story",
-        "numericFilters": f"created_at_i>{cutoff_timestamp}",
-        "hitsPerPage": 50
+        "numericFilters": f"created_at_i>{cutoff}",
+        "hitsPerPage": 30
     }
-    
+    results = []
     try:
-        response = requests.get(url, params=params).json()
-        hits = response.get("hits", [])
-        
-        launches = []
-        for hit in hits:
+        data = requests.get(url, params=params).json()
+        for hit in data.get("hits", []):
             title = hit.get("title", "")
             if "Launch HN:" in title:
-                launches.append({
-                    "id": hit.get("objectID"),
+                results.append({
+                    "source": "Launch HN",
                     "title": title.replace("Launch HN: ", "").strip(),
                     "author": hit.get("author", "Founder"),
                     "url": f"https://news.ycombinator.com/item?id={hit.get('objectID')}",
                     "text": hit.get("story_text") or hit.get("comment_text") or title
                 })
-        return launches
     except Exception as e:
-        print(f"Error fetching from HN Algolia API: {e}")
-        return []
+        print(f"Error in fetch_launch_hn: {e}")
+    return results
 
-def evaluate_startup(client, launch):
-    """Evaluates launch alignment and structures output into JSON."""
+def fetch_who_is_hiring():
+    """Fetches top-level job postings from the latest monthly 'Ask HN: Who is hiring?' thread."""
+    url = "https://hn.algolia.com/api/v1/search"
+    # Find the latest Who is Hiring thread
+    params = {
+        "query": "Ask HN: Who is hiring?",
+        "tags": "story,author_whoishiring",
+        "hitsPerPage": 1
+    }
+    results = []
+    try:
+        res = requests.get(url, params=params).json()
+        hits = res.get("hits", [])
+        if not hits:
+            return []
+        
+        thread_id = hits[0].get("objectID")
+        print(f"Scanning Who is Hiring thread (ID: {thread_id})...")
+        
+        # Pull top comments from this thread
+        comments_url = "https://hn.algolia.com/api/v1/search"
+        comment_params = {
+            "tags": f"comment,story_{thread_id}",
+            "hitsPerPage": 50
+        }
+        comment_data = requests.get(comments_url, params=comment_params).json()
+        
+        for c in comment_data.get("hits", []):
+            text = c.get("comment_text", "")
+            if len(text) < 100:
+                continue
+            
+            # The first line of Who is Hiring comments usually contains: "Company | Role | Location | Stack"
+            first_line = text.split("<p>")[0].replace("&#x2F;", "/").replace("&amp;", "&")
+            company_title = first_line[:80].strip()
+            
+            results.append({
+                "source": "Who is Hiring",
+                "title": company_title,
+                "author": c.get("author", "Hiring Team"),
+                "url": f"https://news.ycombinator.com/item?id={c.get('objectID')}",
+                "text": text[:1500]
+            })
+    except Exception as e:
+        print(f"Error in fetch_who_is_hiring: {e}")
+    return results
+
+def fetch_funding_announcements(days_back=21):
+    """Searches HN for recent funded startup announcements beyond YC."""
+    cutoff = int((datetime.datetime.now() - datetime.timedelta(days=days_back)).timestamp())
+    url = "https://hn.algolia.com/api/v1/search"
+    params = {
+        "query": "seed round OR Series A OR raised OR seed funding",
+        "tags": "story",
+        "numericFilters": f"created_at_i>{cutoff}",
+        "hitsPerPage": 25
+    }
+    results = []
+    try:
+        data = requests.get(url, params=params).json()
+        for hit in data.get("hits", []):
+            title = hit.get("title", "")
+            # Filter out generic articles / big tech news
+            if any(term in title.lower() for term in ["raised", "series a", "seed round", "$"]):
+                results.append({
+                    "source": "Funding News",
+                    "title": title,
+                    "author": hit.get("author", "Founder"),
+                    "url": f"https://news.ycombinator.com/item?id={hit.get('objectID')}",
+                    "text": hit.get("story_text") or title
+                })
+    except Exception as e:
+        print(f"Error in fetch_funding_announcements: {e}")
+    return results
+
+def evaluate_opportunity(client, item):
+    """Evaluates fit, checks funding/hiring signals, and generates outreach."""
     prompt = f"""
 Candidate Background:
 {CANDIDATE_PROFILE}
 
-Startup: {launch['title']}
-Founder Post:
-{launch['text']}
+Opportunity Source: {item['source']}
+Headline/Title: {item['title']}
+Context/Post:
+{item['text']}
 
-Analyze this startup for candidate fit. Respond strictly in valid JSON format:
+Task:
+1. Determine if this company is a high-growth/venture-funded startup actively building or hiring.
+2. Rate Gabriel's match from 1-10 based on his skills in Python, TS/Next.js, C++, Cloud/K8s, Agents, and Real-Time Systems.
+3. If fit >= 7, propose a concrete 2-hour demo project and a 1-sentence cold outreach email hook.
+
+Respond strictly in valid JSON:
 {{
   "score": <number 1-10>,
-  "fit_reason": "<1-2 sentences on why this aligns with Gabriel's tech stack and experience>",
+  "funding_or_hiring_signal": "<e.g., Active Hiring / Seed Stage / Series A>",
+  "fit_reason": "<1-2 sentences on why this aligns with Gabriel's tech stack>",
   "demo_idea": "<A practical micro-demo scoped strictly to 2-3 hours>",
-  "email_hook": "<1-2 sentence compelling cold email hook to the founder>",
-  "suggested_tech_to_showcase": "<comma-separated list of relevant skills from profile>"
+  "email_hook": "<1-2 sentence compelling cold email hook to the founder/engineering lead>"
 }}
 """
     try:
@@ -91,20 +167,13 @@ Analyze this startup for candidate fit. Respond strictly in valid JSON format:
         )
         return json.loads(response.text)
     except Exception as e:
-        print(f"Error evaluating {launch['title']}: {e}")
+        print(f"Error evaluating {item['title']}: {e}")
         return None
 
-def create_notion_page(launch, analysis):
-    """Adds a structured page and CRM card into Notion."""
-    if not NOTION_API_KEY:
-        print("ERROR: NOTION_API_KEY is empty or None!")
-        return
-    else:
-        # Prints something like: Key loaded: ntn_5948... (len: 50)
-        print(f"Key loaded: {NOTION_API_KEY[:8]}... (len: {len(NOTION_API_KEY)})")
-        
+def create_notion_page(item, analysis):
+    """Adds a formatted row and CRM page into Notion."""
     headers = {
-        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Authorization": f"Bearer {NOTION_API_KEY.strip()}",
         "Content-Type": "application/json",
         "Notion-Version": "2022-06-28"
     }
@@ -115,7 +184,7 @@ def create_notion_page(launch, analysis):
         "parent": {"database_id": NOTION_DATABASE_ID},
         "properties": {
             "Company": {
-                "title": [{"text": {"content": launch["title"]}}]
+                "title": [{"text": {"content": item["title"][:100]}}]
             },
             "Score": {
                 "number": int(analysis.get("score", 0))
@@ -124,17 +193,24 @@ def create_notion_page(launch, analysis):
                 "select": {"name": "New Lead"}
             },
             "Founder": {
-                "rich_text": [{"text": {"content": f"@{launch['author']}"}}]
+                "rich_text": [{"text": {"content": f"@{item['author']}"}}]
             },
             "HN Link": {
-                "url": launch["url"]
+                "url": item["url"]
             },
             "Date Added": {
                 "date": {"start": today}
             }
         },
-        # Internal Page Content (Markdown Blocks)
         "children": [
+            {
+                "object": "block",
+                "type": "callout",
+                "callout": {
+                    "rich_text": [{"type": "text", "text": {"content": f"Source: {item['source']} | Signal: {analysis.get('funding_or_hiring_signal', 'Active Venture')}"}}],
+                    "icon": {"emoji": "🚀"}
+                }
+            },
             {
                 "object": "block",
                 "type": "heading_2",
@@ -148,57 +224,65 @@ def create_notion_page(launch, analysis):
             {
                 "object": "block",
                 "type": "heading_2",
-                "heading_2": {"rich_text": [{"type": "text", "text": {"content": "✉️ Cold Email Pitch Hook"}}]}
+                "heading_2": {"rich_text": [{"type": "text", "text": {"content": "✉️ Cold Outreach Pitch Hook"}}]}
             },
             {
                 "object": "block",
-                "type": "callout",
-                "callout": {
-                    "rich_text": [{"type": "text", "text": {"content": analysis.get("email_hook", "")}}],
-                    "icon": {"emoji": "🎯"}
-                }
-            },
-            {
-                "object": "block",
-                "type": "heading_3",
-                "heading_3": {"rich_text": [{"type": "text", "text": {"content": "Alignment & Tech to Highlight"}}]}
+                "type": "quote",
+                "quote": {"rich_text": [{"type": "text", "text": {"content": analysis.get("email_hook", "")}}]}
             },
             {
                 "object": "block",
                 "type": "paragraph",
-                "paragraph": {"rich_text": [{"type": "text", "text": {"content": f"Reason: {analysis.get('fit_reason', '')}\nShowcase: {analysis.get('suggested_tech_to_showcase', '')}"}}]}
+                "paragraph": {"rich_text": [{"type": "text", "text": {"content": f"Match Context: {analysis.get('fit_reason', '')}"}}]}
             }
         ]
     }
     
     res = requests.post("https://api.notion.com/v1/pages", headers=headers, json=payload)
     if res.status_code == 200:
-        print(f"Successfully added {launch['title']} to Notion.")
+        print(f"Successfully added [{item['source']}] {item['title'][:40]}... to Notion.")
     else:
-        print(f"Failed to add {launch['title']}: {res.text}")
-
-
-
-
-
-
+        print(f"Failed to add {item['title'][:30]}: {res.text}")
 
 def main():
-    print("Checking Hacker News for recent YC launches...")
-    launches = fetch_recent_launches(days_back=7)
-    print(f"Found {len(launches)} launches.")
+    print("Aggregating opportunities across multiple startup feeds...")
     
-    if not launches:
-        print("No new launches found this week.")
+    all_leads = []
+    
+    # 1. Recent YC Launches
+    print("-> Fetching Launch HN...")
+    all_leads.extend(fetch_launch_hn(days_back=14))
+    
+    # 2. Direct Hiring Threads
+    print("-> Fetching Ask HN: Who is hiring?...")
+    all_leads.extend(fetch_who_is_hiring())
+    
+    # 3. Funded Startup Announcements
+    print("-> Fetching recent funding announcements...")
+    all_leads.extend(fetch_funding_announcements(days_back=21))
+    
+    print(f"Total opportunities discovered across feeds: {len(all_leads)}")
+    
+    if not all_leads:
+        print("No leads found across feeds.")
         return
-        
+
     client = genai.Client(api_key=GEMINI_API_KEY)
     
-    for launch in launches:
-        analysis = evaluate_startup(client, launch)
-        if analysis and analysis.get("score", 0) >= 7:
-            print(f"High match found ({analysis.get('score')}/10): {launch['title']}")
-            create_notion_page(launch, analysis)
+    # Deduplicate by title to prevent duplicates
+    seen_titles = set()
+    
+    for lead in all_leads:
+        title_key = lead["title"][:40].lower()
+        if title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+        
+        analysis = evaluate_opportunity(client, lead)
+        if analysis and analysis.get("score", 0) >= 8:  # Strict filter for high signal
+            print(f"High match ({analysis.get('score')}/10): {lead['title'][:50]}")
+            create_notion_page(lead, analysis)
 
 if __name__ == "__main__":
     main()
