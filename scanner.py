@@ -1,11 +1,9 @@
 import os
 import json
 import html
-import time
 import datetime
 import requests
 from google import genai
-from google.genai.errors import APIError
 
 # --- CONFIGURATION ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -99,7 +97,7 @@ def fetch_launch_hn(days_back=14):
         "query": "Launch HN:",
         "tags": "story",
         "numericFilters": f"created_at_i>{cutoff}",
-        "hitsPerPage": 20
+        "hitsPerPage": 25
     }
     results = []
     try:
@@ -120,7 +118,6 @@ def fetch_launch_hn(days_back=14):
 
 def fetch_who_is_hiring():
     """Fetches top-level job postings from the LATEST monthly 'Ask HN: Who is hiring?' thread."""
-    # Use search_by_date to guarantee we get the current month's thread
     url = "https://hn.algolia.com/api/v1/search_by_date"
     params = {
         "query": "Ask HN: Who is hiring?",
@@ -133,17 +130,16 @@ def fetch_who_is_hiring():
         hits = res.get("hits", [])
         if not hits:
             return []
-
+        
         latest_thread = hits[0]
         thread_id = latest_thread.get("objectID")
         thread_title = latest_thread.get("title", "")
         print(f"Scanning latest thread: '{thread_title}' (ID: {thread_id})...")
-
-        # Pull top comments from this thread
+        
         comments_url = "https://hn.algolia.com/api/v1/search"
         comment_params = {
             "tags": f"comment,story_{thread_id}",
-            "hitsPerPage": 15
+            "hitsPerPage": 40
         }
         comment_data = requests.get(comments_url, params=comment_params).json()
         
@@ -155,12 +151,11 @@ def fetch_who_is_hiring():
             clean_text = html.unescape(raw_text)
             first_line = clean_text.split("<p>")[0].replace("&#x2F;", "/").replace("&amp;", "&").strip()
             
-            # Filter out non-hiring chatter / replies
+            # Filter non-job chatter / replies
             lower_first = first_line.lower()
-            if any(skip_word in lower_first for skip_word in ["interested", "thanks", "h1b", "promo", "range", "mods", "how to"]):
+            if any(skip in lower_first for skip in ["interested", "thanks", "h1b", "promo", "range", "mods", "how to"]):
                 continue
             
-            # Legitimate company hiring comments generally contain "|" or "-" in the header
             if "|" not in first_line and " - " not in first_line:
                 continue
 
@@ -185,7 +180,7 @@ def fetch_funding_announcements(days_back=14):
         "query": "seed round OR Series A OR raised OR seed funding",
         "tags": "story",
         "numericFilters": f"created_at_i>{cutoff}",
-        "hitsPerPage": 10
+        "hitsPerPage": 20
     }
     results = []
     try:
@@ -204,65 +199,56 @@ def fetch_funding_announcements(days_back=14):
         print(f"Error in fetch_funding_announcements: {e}")
     return results
 
-def is_candidate_potentially_relevant(item):
-    """Quick heuristic filter to avoid unnecessary API calls on obvious mismatches."""
-    text = (item["title"] + " " + item["text"]).lower()
+def evaluate_all_opportunities_batched(client, leads):
+    """Evaluates ALL candidates in a single LLM API call using Gemini's massive context window."""
+    if not leads:
+        return []
 
-    # Must have hiring or venture signals
-    has_hiring = any(word in text for word in ["hiring", "engineer", "developer", "founding", "role", "team"])
-    has_venture = any(word in text for word in ["raised", "series", "seed", "funded", "$", "million", "venture"])
+    leads_payload = json.dumps([
+        {
+            "index": idx,
+            "source": item["source"],
+            "title": item["title"],
+            "text": item["text"][:800]
+        }
+        for idx, item in enumerate(leads)
+    ], indent=2)
 
-    # Avoid clear non-matches
-    bad_keywords = ["freelance", "visa", "non-tech", "sales only", "marketing", "bc2b", "b2b sales"]
-    has_bad_signals = any(word in text for word in bad_keywords)
-
-    return (has_hiring or has_venture) and not has_bad_signals
-
-def evaluate_opportunity(client, item, max_retries=3):
-    """Evaluates fit with rate-limit handling and backoff."""
     prompt = f"""
 Candidate Background:
 {CANDIDATE_PROFILE}
 
-Opportunity Source: {item['source']}
-Headline/Title: {item['title']}
-Context/Post:
-{item['text']}
+List of Startup Opportunities & Hiring Posts:
+{leads_payload}
 
 Task:
-1. Determine if this company is a high-growth/venture-funded startup actively building or hiring.
-2. Rate Gabriel's match from 1-10 based on his skills in Python, TS/Next.js, C++, Cloud/K8s, Agents, and Real-Time Systems.
-3. If fit >= 7, propose a concrete 2-hour demo project and a 1-sentence cold outreach email hook.
+1. Review all items above.
+2. Filter for high-growth tech startups, funded companies, or active engineering openings where Gabriel is a strong match (Score >= 7).
+3. For each high match, generate a 2-hour demo concept and an outreach email hook.
 
-Respond strictly in valid JSON format:
-{{
-  "score": <number 1-10>,
-  "funding_or_hiring_signal": "<e.g., Active Hiring / Seed Stage / Series A>",
-  "fit_reason": "<1-2 sentences on why this aligns with Gabriel's tech stack>",
-  "demo_idea": "<A practical micro-demo scoped strictly to 2-3 hours>",
-  "email_hook": "<1-2 sentence compelling cold email hook to the founder/engineering lead>"
-}}
+Respond strictly with a valid JSON array of objects:
+[
+  {{
+    "index": <integer corresponding to the input index>,
+    "score": <number 7-10>,
+    "funding_or_hiring_signal": "<e.g., Active Hiring / Seed Stage / Series A>",
+    "fit_reason": "<1-2 sentences on why this matches Gabriel's background>",
+    "demo_idea": "<A concrete micro-demo scoped strictly to 2-3 hours>",
+    "email_hook": "<1-2 sentence high-conversion cold email hook>"
+  }}
+]
 """
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model="gemini-3.6-flash",
-                contents=prompt,
-                config={"response_mime_type": "application/json"}
-            )
-            return json.loads(response.text)
-        except APIError as e:
-            if "429" in str(e) or "503" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                wait_seconds = (attempt + 1) * 10
-                print(f"Rate limited on '{item['title'][:30]}'. Waiting {wait_seconds}s before retry ({attempt+1}/{max_retries})...")
-                time.sleep(wait_seconds)
-            else:
-                print(f"API Error evaluating {item['title']}: {e}")
-                return None
-        except Exception as e:
-            print(f"Error evaluating {item['title']}: {e}")
-            return None
-    return None
+    try:
+        print(f"Evaluating {len(leads)} opportunities in 1 single Gemini batch call...")
+        response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=prompt,
+            config={"response_mime_type": "application/json"}
+        )
+        return json.loads(response.text)
+    except Exception as e:
+        print(f"Error during batched evaluation: {e}")
+        return []
 
 def create_notion_page(item, analysis):
     """Adds a formatted row and CRM page into Notion."""
@@ -351,62 +337,48 @@ def main():
     print(f"Found {len(existing_titles)} existing companies in Notion tracker.")
 
     print("Aggregating opportunities across multiple startup feeds...")
-    all_leads = []
+    raw_leads = []
     
     print("-> Fetching Launch HN...")
-    all_leads.extend(fetch_launch_hn(days_back=14))
+    raw_leads.extend(fetch_launch_hn(days_back=14))
     
     print("-> Fetching Ask HN: Who is hiring?...")
-    all_leads.extend(fetch_who_is_hiring())
+    raw_leads.extend(fetch_who_is_hiring())
     
     print("-> Fetching recent funding announcements...")
-    all_leads.extend(fetch_funding_announcements(days_back=14))
+    raw_leads.extend(fetch_funding_announcements(days_back=14))
     
-    print(f"Total discovered leads: {len(all_leads)}")
-    
-    if not all_leads:
-        print("No leads found across feeds.")
-        return
-
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    
-    seen_in_this_batch = set()
-    new_leads_processed = 0
-    
-    for lead in all_leads:
+    # Deduplicate against Notion and within the current run BEFORE the LLM call
+    filtered_leads = []
+    seen = set()
+    for lead in raw_leads:
         title_clean = lead["title"].strip().lower()
         title_key = title_clean[:40]
         url_key = lead["url"].strip().lower()
 
-        # 1. Deduplicate against existing Notion records
-        if title_key in existing_titles or url_key in existing_urls:
+        if title_key in existing_titles or url_key in existing_urls or title_key in seen:
             continue
+        seen.add(title_key)
+        filtered_leads.append(lead)
 
-        # 2. Deduplicate within current run
-        if title_key in seen_in_this_batch:
-            continue
-        seen_in_this_batch.add(title_key)
+    print(f"Total new leads to evaluate: {len(filtered_leads)}")
+    if not filtered_leads:
+        print("No new leads to evaluate this week.")
+        return
 
-        # 3. Pre-filter to avoid API calls on obvious mismatches
-        if not is_candidate_potentially_relevant(lead):
-            continue
-
-        analysis = evaluate_opportunity(client, lead)
-
-        try:
-            score = float(analysis.get("score", 0)) if analysis else 0
-        except (ValueError, TypeError):
-            score = 0
-
-        if analysis and score >= 7:
-            print(f"High match ({score}/10): {lead['title'][:50]}")
-            create_notion_page(lead, analysis)
-            existing_titles.add(title_key)
-            existing_urls.add(url_key)
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    
+    # 1 Single Request to Gemini
+    matches = evaluate_all_opportunities_batched(client, filtered_leads)
+    
+    new_leads_processed = 0
+    for match in matches:
+        idx = match.get("index")
+        if idx is not None and 0 <= idx < len(filtered_leads):
+            lead = filtered_leads[idx]
+            print(f"High match ({match.get('score')}/10): {lead['title'][:50]}")
+            create_notion_page(lead, match)
             new_leads_processed += 1
-
-        # Pacing to stay comfortably within free-tier rate limits
-        time.sleep(10)
 
     print(f"Done. Added {new_leads_processed} new opportunities to Notion.")
 
